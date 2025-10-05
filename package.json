@@ -1,0 +1,17 @@
+{
+  "name": "pixel-tracker",
+  "version": "1.0.0",
+  "description": "Lightweight analytics pixel for portfolio and demo sites",
+  "scripts": {
+    "dev": "npx serve public -l 3006 --cors",
+    "build": "echo 'Nothing to build - static pixel'",
+    "start": "npx serve public -l 3006 --cors"
+  },
+  "keywords": [
+    "pixel",
+    "analytics",
+    "tracking",
+    "cdn"
+  ],
+  "license": "MIT"
+}
