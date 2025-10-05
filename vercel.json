@@ -1,18 +1,7 @@
 {
-  "version": 0.1,
+  "version": 1,
   "name": "pixel-tracker",
-  "builds": [
-    {
-      "src": "public/**/*",
-      "use": "@vercel/static"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/public/$1"
-    }
-  ],
+  "public": true,
   "headers": [
     {
       "source": "/(.*)",
