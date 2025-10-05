@@ -1,73 +1,121 @@
 (() => {
-  // --- Local Debug Mode ---
+  // --- Config ---
   const DEBUG = true;
-  const ANALYTICS_URL = "https://analytics.deepikaads.com/track"; // 👈 your backend endpoint
+  const ANALYTICS_URL = "https://analytics.deepikaads.com/track";
+  const BATCH_INTERVAL = 5000; // 5s batching window
+  const HEARTBEAT_INTERVAL = 15000; // session alive ping every 15s
 
-  // Create a unique session ID
+  // --- Session ---
   const sessionId = `${Date.now()}-${Math.random()
     .toString(36)
     .substring(2, 10)}`;
+  const startTime = Date.now();
 
-  // Utility: send event to backend
-  const sendEvent = async (type, data = {}) => {
+  // --- Internal state ---
+  const eventQueue = [];
+  let locationCache = null;
+  let heartbeatTimer = null;
+
+  // --- Utilities ---
+  const log = (...args) => DEBUG && console.log("[Pixel]", ...args);
+
+  const enqueueEvent = (type, data = {}) => {
+    const event = {
+      type,
+      data,
+      url: window.location.href,
+      referrer: document.referrer,
+      timestamp: new Date().toISOString(),
+      sessionId,
+      userAgent: navigator.userAgent,
+    };
+    eventQueue.push(event);
+  };
+
+  const flushEvents = async () => {
+    if (!eventQueue.length) return;
+    const payload = eventQueue.splice(0, eventQueue.length);
+    log(`Flushing ${payload.length} events`);
+
     if (DEBUG) {
-      console.log(`[Pixel Debug] ${type.toUpperCase()} event:`, data);
+      console.table(payload);
       return;
     }
+
     try {
       await fetch(ANALYTICS_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type,
-          data,
-          url: window.location.href,
-          referrer: document.referrer,
-          timestamp: new Date().toISOString(),
-          sessionId,
-          userAgent: navigator.userAgent,
-        }),
+        body: JSON.stringify({ batch: payload }),
+        keepalive: true, // important for unload events
       });
     } catch (err) {
-      console.warn("Pixel send failed:", err);
+      console.warn("Pixel flush failed:", err);
+      // push events back if failed
+      eventQueue.unshift(...payload);
     }
   };
 
-  // 1️⃣ Track Page Visit + Location
-  const trackVisit = async () => {
+  // --- Location (cached) ---
+  const getLocation = async () => {
+    if (locationCache) return locationCache;
     try {
-      const ipRes = await fetch("https://ipapi.co/json/"); // free IP geo service
-      const ipData = await ipRes.json();
-      const country = ipData.country_name || "Unknown";
-
-      await sendEvent("visit", { country });
-      console.log(`Pixel: Someone from ${country} has visited your site.`);
-    } catch (e) {
-      await sendEvent("visit", { country: "Unknown" });
+      const res = await fetch("https://ipapi.co/json/");
+      const data = await res.json();
+      locationCache = {
+        country: data.country_name || "Unknown",
+        city: data.city || "Unknown",
+        ip: data.ip || "Hidden",
+      };
+    } catch (err) {
+      locationCache = { country: "Unknown", city: "Unknown" };
     }
+    return locationCache;
   };
 
-  // 2️⃣ Track Clicks
+  // --- Trackers ---
+  const trackVisit = async () => {
+    const loc = await getLocation();
+    enqueueEvent("visit", { ...loc });
+    log(`Visit detected from ${loc.city}, ${loc.country}`);
+  };
+
   const trackClicks = () => {
     document.addEventListener("click", (e) => {
       const target = e.target.closest("[data-track]");
       if (target) {
         const label = target.getAttribute("data-track");
-        sendEvent("click", { label });
-        console.log(`Pixel: Clicked on ${label}`);
+        enqueueEvent("click", { label });
+        log(`Clicked on ${label}`);
       }
     });
   };
 
-  // 3️⃣ Track Time Spent
-  let startTime = Date.now();
-  window.addEventListener("beforeunload", () => {
-    const duration = Math.round((Date.now() - startTime) / 1000);
-    sendEvent("time_spent", { duration });
-    console.log(`Pixel: User spent ${duration}s on this page.`);
-  });
+  const trackTimeSpent = () => {
+    window.addEventListener("beforeunload", () => {
+      const duration = Math.round((Date.now() - startTime) / 1000);
+      enqueueEvent("time_spent", { duration });
+      flushEvents();
+      log(`User spent ${duration}s`);
+    });
+  };
 
-  // Bootstrap tracking
-  trackVisit();
-  trackClicks();
+  const startHeartbeat = () => {
+    heartbeatTimer = setInterval(() => {
+      enqueueEvent("heartbeat", { uptime: Date.now() - startTime });
+      flushEvents();
+    }, HEARTBEAT_INTERVAL);
+  };
+
+  // --- Batching Loop ---
+  setInterval(flushEvents, BATCH_INTERVAL);
+
+  // --- Bootstrap ---
+  (async () => {
+    await trackVisit();
+    trackClicks();
+    trackTimeSpent();
+    startHeartbeat();
+    log("Pixel initialized ✅");
+  })();
 })();
