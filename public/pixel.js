@@ -2,7 +2,6 @@
   // --- Config ---
   const DEBUG = false;
   const ANALYTICS_URL = "https://analytics-backend-97k7.onrender.com/track";
-  //const ANALYTICS_URL = "http://localhost:4000/track";
   const BATCH_INTERVAL = 5000; // 5s batching window
   const HEARTBEAT_INTERVAL = 15000; // session alive ping every 15s
 
@@ -16,6 +15,7 @@
   const eventQueue = [];
   let locationCache = null;
   let heartbeatTimer = null;
+  let batchTimer = null;
 
   // --- Utilities ---
   const log = (...args) => DEBUG && console.log("[Pixel]", ...args);
@@ -31,6 +31,7 @@
       userAgent: navigator.userAgent,
     };
     eventQueue.push(event);
+    log(`Enqueued event: ${type}`);
   };
 
   const flushEvents = async () => {
@@ -44,12 +45,18 @@
     }
 
     try {
-      await fetch(ANALYTICS_URL, {
+      const response = await fetch(ANALYTICS_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ batch: payload }),
-        keepalive: true, // important for unload events
+        keepalive: true,
       });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      log(`Successfully sent ${payload.length} events`);
     } catch (err) {
       console.warn("Pixel flush failed:", err);
       // push events back if failed
@@ -61,7 +68,17 @@
   const getLocation = async () => {
     if (locationCache) return locationCache;
     try {
-      const res = await fetch("https://ipapi.co/json/");
+      // Add timeout to prevent hanging
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      const res = await fetch("https://ipapi.co/json/", {
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       const data = await res.json();
       locationCache = {
         country: data.country_name || "Unknown",
@@ -69,6 +86,7 @@
         ip: data.ip || "Hidden",
       };
     } catch (err) {
+      console.warn("Location detection failed:", err);
       locationCache = { country: "Unknown", city: "Unknown" };
     }
     return locationCache;
@@ -76,9 +94,15 @@
 
   // --- Trackers ---
   const trackVisit = async () => {
-    const loc = await getLocation();
-    enqueueEvent("visit", { ...loc });
-    log(`Visit detected from ${loc.city}, ${loc.country}`);
+    try {
+      const loc = await getLocation();
+      enqueueEvent("visit", { ...loc });
+      log(`Visit detected from ${loc.city}, ${loc.country}`);
+    } catch (err) {
+      // Still track visit even if location fails
+      enqueueEvent("visit", { country: "Unknown", city: "Unknown" });
+      log(`Visit detected (location failed)`);
+    }
   };
 
   const trackClicks = () => {
@@ -96,7 +120,25 @@
     window.addEventListener("beforeunload", () => {
       const duration = Math.round((Date.now() - startTime) / 1000);
       enqueueEvent("time_spent", { duration });
-      flushEvents();
+      // Force immediate flush on page unload
+      fetch(ANALYTICS_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          batch: [
+            {
+              type: "time_spent",
+              data: { duration },
+              url: window.location.href,
+              referrer: document.referrer,
+              timestamp: new Date().toISOString(),
+              sessionId,
+              userAgent: navigator.userAgent,
+            },
+          ],
+        }),
+        keepalive: true,
+      }).catch(console.warn);
       log(`User spent ${duration}s`);
     });
   };
@@ -109,14 +151,25 @@
   };
 
   // --- Batching Loop ---
-  setInterval(flushEvents, BATCH_INTERVAL);
+  const startBatching = () => {
+    batchTimer = setInterval(flushEvents, BATCH_INTERVAL);
+  };
 
   // --- Bootstrap ---
-  (async () => {
-    await trackVisit();
+  (() => {
+    // Start all trackers immediately without waiting
+    trackVisit(); // Don't await - let it run in background
     trackClicks();
     trackTimeSpent();
     startHeartbeat();
+    startBatching();
     log("Pixel initialized ✅");
+
+    // Expose for debugging
+    window.pixelDebug = {
+      eventQueue,
+      flushEvents,
+      sessionId,
+    };
   })();
 })();
