@@ -2,20 +2,20 @@
   // --- Config ---
   const DEBUG = false;
   const ANALYTICS_URL = "https://analytics-backend-97k7.onrender.com/track";
-  const BATCH_INTERVAL = 5000; // 5s batching window
-  const HEARTBEAT_INTERVAL = 15000; // session alive ping every 15s
+  const BATCH_INTERVAL = 5000;
+  const HEARTBEAT_INTERVAL = 30000; // Reduced from 15s to 30s to reduce noise
 
   // --- Session ---
   const sessionId = `${Date.now()}-${Math.random()
     .toString(36)
-    .substring(2, 10)}`;
+    .substring(2, 8)}`;
   const startTime = Date.now();
+  let pageViewSent = false;
 
   // --- Internal state ---
   const eventQueue = [];
   let locationCache = null;
   let heartbeatTimer = null;
-  let batchTimer = null;
 
   // --- Utilities ---
   const log = (...args) => DEBUG && console.log("[Pixel]", ...args);
@@ -31,13 +31,12 @@
       userAgent: navigator.userAgent,
     };
     eventQueue.push(event);
-    log(`Enqueued event: ${type}`);
+    log(`Enqueued event: ${type}`, data);
   };
 
   const flushEvents = async () => {
     if (!eventQueue.length) return;
     const payload = eventQueue.splice(0, eventQueue.length);
-    log(`Flushing ${payload.length} events`);
 
     if (DEBUG) {
       console.table(payload);
@@ -52,23 +51,19 @@
         keepalive: true,
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      log(`Successfully sent ${payload.length} events`);
+      log(`Sent ${payload.length} events`);
     } catch (err) {
       console.warn("Pixel flush failed:", err);
-      // push events back if failed
       eventQueue.unshift(...payload);
     }
   };
 
-  // --- Location (cached) ---
+  // --- Location ---
   const getLocation = async () => {
     if (locationCache) return locationCache;
     try {
-      // Add timeout to prevent hanging
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000);
 
@@ -78,30 +73,43 @@
       clearTimeout(timeoutId);
 
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
       const data = await res.json();
+
       locationCache = {
         country: data.country_name || "Unknown",
         city: data.city || "Unknown",
-        ip: data.ip || "Hidden",
+        region: data.region || "Unknown",
+        ip: data.ip ? data.ip.substring(0, 8) + "..." : "Hidden",
       };
     } catch (err) {
-      console.warn("Location detection failed:", err);
-      locationCache = { country: "Unknown", city: "Unknown" };
+      locationCache = {
+        country: "Unknown",
+        city: "Unknown",
+        region: "Unknown",
+      };
     }
     return locationCache;
   };
 
   // --- Trackers ---
-  const trackVisit = async () => {
+  const trackPageView = async () => {
+    if (pageViewSent) return;
+
     try {
       const loc = await getLocation();
-      enqueueEvent("visit", { ...loc });
-      log(`Visit detected from ${loc.city}, ${loc.country}`);
+      enqueueEvent("visit", {
+        ...loc,
+        page_title: document.title,
+        viewport: `${window.innerWidth}x${window.innerHeight}`,
+      });
+      pageViewSent = true;
+      log(`Page view from ${loc.city}, ${loc.country}`);
     } catch (err) {
-      // Still track visit even if location fails
-      enqueueEvent("visit", { country: "Unknown", city: "Unknown" });
-      log(`Visit detected (location failed)`);
+      enqueueEvent("visit", {
+        country: "Unknown",
+        city: "Unknown",
+        page_title: document.title,
+      });
     }
   };
 
@@ -110,66 +118,95 @@
       const target = e.target.closest("[data-track]");
       if (target) {
         const label = target.getAttribute("data-track");
-        enqueueEvent("click", { label });
-        log(`Clicked on ${label}`);
+        const elementType = target.tagName.toLowerCase();
+
+        enqueueEvent("click", {
+          label,
+          element_type: elementType,
+          element_text: target.textContent?.trim().substring(0, 50) || "",
+        });
+        log(`Clicked: ${label} (${elementType})`);
       }
     });
+  };
+
+  const trackEngagement = () => {
+    let scrollDepth = 0;
+
+    window.addEventListener(
+      "scroll",
+      () => {
+        const newDepth = Math.round(
+          (window.scrollY /
+            (document.documentElement.scrollHeight - window.innerHeight)) *
+            100
+        );
+        if (newDepth > scrollDepth) {
+          scrollDepth = newDepth;
+          // Only track major scroll milestones
+          if ([25, 50, 75, 90, 100].includes(scrollDepth)) {
+            enqueueEvent("scroll", { depth: scrollDepth });
+          }
+        }
+      },
+      { passive: true }
+    );
   };
 
   const trackTimeSpent = () => {
     window.addEventListener("beforeunload", () => {
       const duration = Math.round((Date.now() - startTime) / 1000);
-      enqueueEvent("time_spent", { duration });
-      // Force immediate flush on page unload
-      fetch(ANALYTICS_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      enqueueEvent("session_end", {
+        duration,
+        final_url: window.location.href,
+      });
+
+      // Final flush
+      if (navigator.sendBeacon) {
+        const data = JSON.stringify({
           batch: [
             {
-              type: "time_spent",
+              type: "session_end",
               data: { duration },
               url: window.location.href,
-              referrer: document.referrer,
               timestamp: new Date().toISOString(),
               sessionId,
-              userAgent: navigator.userAgent,
             },
           ],
-        }),
-        keepalive: true,
-      }).catch(console.warn);
-      log(`User spent ${duration}s`);
+        });
+        navigator.sendBeacon(ANALYTICS_URL, data);
+      }
     });
   };
 
   const startHeartbeat = () => {
     heartbeatTimer = setInterval(() => {
-      enqueueEvent("heartbeat", { uptime: Date.now() - startTime });
+      enqueueEvent("heartbeat", {
+        uptime: Date.now() - startTime,
+        active_time: Math.round((Date.now() - startTime) / 1000),
+      });
       flushEvents();
     }, HEARTBEAT_INTERVAL);
   };
 
-  // --- Batching Loop ---
+  // --- Batching ---
   const startBatching = () => {
-    batchTimer = setInterval(flushEvents, BATCH_INTERVAL);
+    setInterval(flushEvents, BATCH_INTERVAL);
   };
 
   // --- Bootstrap ---
   (() => {
-    // Start all trackers immediately without waiting
-    trackVisit(); // Don't await - let it run in background
+    trackPageView();
     trackClicks();
+    trackEngagement();
     trackTimeSpent();
     startHeartbeat();
     startBatching();
     log("Pixel initialized ✅");
 
-    // Expose for debugging
-    window.pixelDebug = {
-      eventQueue,
-      flushEvents,
-      sessionId,
-    };
+    // Debug exposure
+    if (DEBUG) {
+      window.pixelDebug = { eventQueue, flushEvents, sessionId };
+    }
   })();
 })();
