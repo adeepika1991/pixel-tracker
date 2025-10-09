@@ -1,7 +1,8 @@
 (() => {
   // --- Config ---
-  const DEBUG = true;
-  const ANALYTICS_URL = "https://analytics.deepikaads.com/track";
+  const DEBUG = false;
+  const ANALYTICS_URL = "https://analytics-backend-97k7.onrender.com/track";
+  //const ANALYTICS_URL = "http://localhost:4000/track";
   const BATCH_INTERVAL = 5000; // 5s batching window
   const HEARTBEAT_INTERVAL = 15000; // session alive ping every 15s
 
